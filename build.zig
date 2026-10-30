@@ -50,4 +50,18 @@ pub fn build(b: *std.Build) void {
     run_cmd.step.dependOn(b.getInstallStep());
     run_cmd.addPassthruArgs();
     b.step("run", "Run the forecaster").dependOn(&run_cmd.step);
+
+    // Library module for downstream consumers (e.g. the HTTP server in the forecast service).
+    const lib_mod = b.addModule("timestral", .{
+        .root_source_file = b.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = blas != .builtin,
+        .imports = &.{.{ .name = "c", .module = c_mod }},
+    });
+    switch (blas) {
+        .accelerate => lib_mod.linkFramework("Accelerate", .{}),
+        .openblas => lib_mod.linkSystemLibrary("openblas", .{}),
+        .builtin => {},
+    }
 }

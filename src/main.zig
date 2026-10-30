@@ -92,7 +92,6 @@ fn parseArgs(argv: []const [:0]const u8, env: *const std.process.Environ.Map) !A
         } else if (std.mem.eql(u8, a, "--time")) {
             args.time = true;
         } else if (a.len > 0 and a[0] == '-') {
-            sys.eprintf("unknown option: {s}\n", .{a});
             return error.UnknownOption;
         } else {
             if (npos == 2) return error.TooManyArguments;
@@ -158,7 +157,6 @@ fn parseBlocks(allocator: std.mem.Allocator, text: []const u8) !Blocks {
             len = n;
             have_len = true;
         } else if (n != len) {
-            sys.eprintf("a line has {d} values, expected {d}\n", .{ n, len });
             return error.RaggedInput;
         }
         rows_in_block += 1;
@@ -171,8 +169,8 @@ fn parseBlocks(allocator: std.mem.Allocator, text: []const u8) !Blocks {
     return .{ .data = try vals.toOwnedSlice(allocator), .blocks = blocks, .rows = rows, .len = len };
 }
 
-fn loadBlocks(allocator: std.mem.Allocator, path: []const u8) !Blocks {
-    const text = try sys.readFile(allocator, path);
+fn loadBlocks(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Blocks {
+    const text = try sys.readFile(io, allocator, path);
     defer allocator.free(text);
     return parseBlocks(allocator, text);
 }
@@ -184,11 +182,11 @@ fn toF32(allocator: std.mem.Allocator, x: []const f64) ![]f32 {
 }
 
 /// A covariate file, checked against the series: one block per series, rows of `len` values.
-fn covariateFile(allocator: std.mem.Allocator, path: ?[]const u8, batch: usize, len: usize, what: []const u8) !?Blocks {
+fn covariateFile(io: std.Io, allocator: std.mem.Allocator, path: ?[]const u8, batch: usize, len: usize, what: []const u8) !?Blocks {
     const p = path orelse return null;
-    const blk = try loadBlocks(allocator, p);
+    const blk = try loadBlocks(io, allocator, p);
     if (blk.blocks != batch or blk.len != len) {
-        sys.eprintf("{s}: expected {d} series with {d} values per line, got {d} series with {d}\n", .{ what, batch, len, blk.blocks, blk.len });
+        sys.eprintf(io, "{s}: expected {d} series with {d} values per line, got {d} series with {d}\n", .{ what, batch, len, blk.blocks, blk.len });
         return error.CovariateShape;
     }
     return blk;
@@ -196,46 +194,48 @@ fn covariateFile(allocator: std.mem.Allocator, path: ?[]const u8, batch: usize, 
 
 fn run(init: std.process.Init) !void {
     const allocator = init.gpa;
-    sys.io = init.io; // until the worker pool below replaces it; lets argument errors print
 
     var arg_iter = try init.minimal.args.iterateAllocator(allocator);
     defer arg_iter.deinit();
     var argv: std.ArrayList([:0]const u8) = .empty;
     defer argv.deinit(allocator);
     while (arg_iter.next()) |a| try argv.append(allocator, a);
-    const args = try parseArgs(argv.items, init.environ_map);
+    const args = parseArgs(argv.items, init.environ_map) catch |err| {
+        sys.eprintf(init.io, "argument error: {s}\n", .{@errorName(err)});
+        return err;
+    };
 
     // Worker pool for `par.forRange` (this thread plus `threads - 1` workers); also the `Io`
     // behind file access and downloads.
     par.threads = if (args.threads == 0) (std.Thread.getCpuCount() catch 1) else args.threads;
     var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(par.threads - 1) });
     defer threaded.deinit();
-    sys.io = threaded.io();
-    if (par.threads > 1) par.io = sys.io;
-    const t_start = sys.now();
+    const io = threaded.io();
+    if (par.threads > 1) par.io = io;
+    const t_start = sys.now(io);
 
-    const model_dir = hub.resolve(allocator, init.environ_map, args.model, args.revision, args.offline) catch |err| {
-        sys.eprintf("cannot find model '{s}' ({s})\n", .{ args.model, @errorName(err) });
+    const model_dir = hub.resolve(io, allocator, init.environ_map, args.model, args.revision, args.offline) catch |err| {
+        sys.eprintf(io, "cannot find model '{s}' ({s})\n", .{ args.model, @errorName(err) });
         return err;
     };
     defer allocator.free(model_dir);
 
     const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
     defer allocator.free(cfg_path);
-    const cfg_text = try sys.readFile(allocator, cfg_path);
+    const cfg_text = try sys.readFile(io, allocator, cfg_path);
     defer allocator.free(cfg_text);
     const parsed = try cfg.parse(allocator, cfg_text);
     defer parsed.deinit();
 
     const w_path = try std.fmt.allocPrint(allocator, "{s}/model.safetensors", .{model_dir});
     defer allocator.free(w_path);
-    var weights = try st.Weights.open(allocator, w_path);
-    defer weights.close();
-    var model = try model_mod.Model.load(allocator, parsed.value, &weights);
+    var weights = try st.Weights.open(io, allocator, w_path);
+    defer weights.close(io);
+    var model = try model_mod.Model.load(io, allocator, parsed.value, &weights);
     defer model.deinit(allocator);
-    const t_loaded = sys.now();
+    const t_loaded = sys.now(io);
 
-    const series = try loadBlocks(allocator, args.series);
+    const series = try loadBlocks(io, allocator, args.series);
     defer allocator.free(series.data);
     const b = series.blocks;
     const v = series.rows;
@@ -251,10 +251,10 @@ fn run(init: std.process.Init) !void {
     }
 
     var cov: forecaster.Covariates = .{};
-    const past = try covariateFile(allocator, args.past, b, t, "--past");
-    const known = try covariateFile(allocator, args.known, b, t + args.horizon, "--known");
-    const cat_past = try covariateFile(allocator, args.cat_past, b, t, "--cat-past");
-    const cat_known = try covariateFile(allocator, args.cat_known, b, t + args.horizon, "--cat-known");
+    const past = try covariateFile(io, allocator, args.past, b, t, "--past");
+    const known = try covariateFile(io, allocator, args.known, b, t + args.horizon, "--known");
+    const cat_past = try covariateFile(io, allocator, args.cat_past, b, t, "--cat-past");
+    const cat_known = try covariateFile(io, allocator, args.cat_known, b, t + args.horizon, "--cat-known");
     defer for ([_]?Blocks{ past, known, cat_past, cat_known }) |blk| if (blk) |x| allocator.free(x.data);
     const past32 = if (past) |p| try toF32(allocator, p.data) else null;
     defer if (past32) |x| allocator.free(x);
@@ -279,7 +279,7 @@ fn run(init: std.process.Init) !void {
 
     const result = try forecaster.forecast(allocator, &model, values, observed, b, v, t, args.horizon, cov, args.opts);
     defer allocator.free(result);
-    if (args.time) sys.eprintf("load={d:.3}s forecast={d:.3}s\n", .{ t_loaded - t_start, sys.now() - t_loaded });
+    if (args.time) sys.eprintf(io, "load={d:.3}s forecast={d:.3}s\n", .{ t_loaded - t_start, sys.now(io) - t_loaded });
 
     const q = parsed.value.numQuantiles();
     var out: std.ArrayList(u8) = .empty;
@@ -296,14 +296,14 @@ fn run(init: std.process.Init) !void {
             }
         }
     }
-    try sys.writeStdout(out.items);
+    try sys.writeStdout(io, out.items);
 }
 
 pub fn main(init: std.process.Init) u8 {
     run(init) catch |err| {
         switch (err) {
-            error.MissingArguments, error.MissingValue, error.InvalidNumber, error.UnknownOption, error.TooManyArguments => sys.eprint(usage),
-            else => sys.eprintf("error: {s}\n", .{@errorName(err)}),
+            error.MissingArguments, error.MissingValue, error.InvalidNumber, error.UnknownOption, error.TooManyArguments => sys.eprint(init.io, usage),
+            else => sys.eprintf(init.io, "error: {s}\n", .{@errorName(err)}),
         }
         return 1;
     };

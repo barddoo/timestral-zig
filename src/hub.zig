@@ -17,18 +17,18 @@ fn cacheRoot(allocator: Allocator, env: *const std.process.Environ.Map) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/.cache/huggingface/hub", .{home});
 }
 
-fn snapshotComplete(allocator: Allocator, dir: []const u8) !bool {
+fn snapshotComplete(io: std.Io, allocator: Allocator, dir: []const u8) !bool {
     for (files) |f| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, f });
         defer allocator.free(p);
-        if (!sys.exists(p)) return false;
+        if (!sys.exists(io, p)) return false;
     }
     return true;
 }
 
 /// A directory holding the model files. `offline` forbids network access.
-pub fn resolve(allocator: Allocator, env: *const std.process.Environ.Map, spec: []const u8, revision: []const u8, offline: bool) ![]u8 {
-    if (try snapshotComplete(allocator, spec)) return allocator.dupe(u8, spec);
+pub fn resolve(io: std.Io, allocator: Allocator, env: *const std.process.Environ.Map, spec: []const u8, revision: []const u8, offline: bool) ![]u8 {
+    if (try snapshotComplete(io, allocator, spec)) return allocator.dupe(u8, spec);
 
     // Anything else must be a Hub repo id, `org/name`.
     const slash = std.mem.indexOfScalar(u8, spec, '/') orelse return error.ModelNotFound;
@@ -44,7 +44,7 @@ pub fn resolve(allocator: Allocator, env: *const std.process.Environ.Map, spec: 
     defer allocator.free(ref_path);
     var commit: ?[]u8 = null;
     defer if (commit) |cm| allocator.free(cm);
-    if (sys.readFile(allocator, ref_path)) |txt| {
+    if (sys.readFile(io, allocator, ref_path)) |txt| {
         defer allocator.free(txt);
         const trimmed = std.mem.trim(u8, txt, " \r\n\t");
         if (trimmed.len > 0) commit = try allocator.dupe(u8, trimmed);
@@ -53,18 +53,18 @@ pub fn resolve(allocator: Allocator, env: *const std.process.Environ.Map, spec: 
     }
     if (commit) |cm| {
         const snap = try std.fmt.allocPrint(allocator, "{s}/snapshots/{s}", .{ repo_dir, cm });
-        if (try snapshotComplete(allocator, snap)) return snap;
+        if (try snapshotComplete(io, allocator, snap)) return snap;
         allocator.free(snap);
     }
 
     if (offline) return error.NotCachedOffline;
-    return download(allocator, env, spec, revision, repo_dir);
+    return download(io, allocator, env, spec, revision, repo_dir);
 }
 
 /// GET `url` into `writer`, following redirects. The token is a privileged header, so it is only
 /// sent to the original host and never to the CDN a download redirects to.
-fn fetch(allocator: Allocator, url: []const u8, writer: *std.Io.Writer, token: ?[]const u8) !void {
-    var client: std.http.Client = .{ .allocator = allocator, .io = sys.io };
+fn fetch(io: std.Io, allocator: Allocator, url: []const u8, writer: *std.Io.Writer, token: ?[]const u8) !void {
+    var client: std.http.Client = .{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     var auth_buf: [512]u8 = undefined;
@@ -83,21 +83,21 @@ fn fetch(allocator: Allocator, url: []const u8, writer: *std.Io.Writer, token: ?
     switch (res.status) {
         .ok => {},
         .unauthorized, .forbidden => {
-            sys.eprint("access denied: the repo is private or gated; set HF_TOKEN to a token with access\n");
+            sys.eprint(io, "access denied: the repo is private or gated; set HF_TOKEN to a token with access\n");
             return error.AccessDenied;
         },
         .not_found => return error.RepoOrRevisionNotFound,
         else => {
-            sys.eprintf("unexpected HTTP status {d}\n", .{@backingInt(res.status)});
+            sys.eprintf(io, "unexpected HTTP status {d}\n", .{@backingInt(res.status)});
             return error.DownloadFailed;
         },
     }
 }
 
-fn download(allocator: Allocator, env: *const std.process.Environ.Map, repo: []const u8, revision: []const u8, repo_dir: []const u8) ![]u8 {
+fn download(io: std.Io, allocator: Allocator, env: *const std.process.Environ.Map, repo: []const u8, revision: []const u8, repo_dir: []const u8) ![]u8 {
     const token: ?[]const u8 = env.get("HF_TOKEN") orelse env.get("HUGGING_FACE_HUB_TOKEN");
     const cwd = Dir.cwd();
-    try cwd.createDirPath(sys.io, repo_dir);
+    try cwd.createDirPath(io, repo_dir);
 
     // The Hub API resolves the revision to a commit; every file is then fetched at that commit.
     var rev_enc: std.Io.Writer.Allocating = .init(allocator);
@@ -109,14 +109,14 @@ fn download(allocator: Allocator, env: *const std.process.Environ.Map, repo: []c
     defer allocator.free(api_url);
     var api_body: std.Io.Writer.Allocating = .init(allocator);
     defer api_body.deinit();
-    try fetch(allocator, api_url, &api_body.writer, token);
+    try fetch(io, allocator, api_url, &api_body.writer, token);
     const parsed = try std.json.parseFromSlice(struct { sha: []const u8 }, allocator, api_body.written(), .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     const commit = parsed.value.sha;
 
     const snap = try std.fmt.allocPrint(allocator, "{s}/snapshots/{s}", .{ repo_dir, commit });
     errdefer allocator.free(snap);
-    try cwd.createDirPath(sys.io, snap);
+    try cwd.createDirPath(io, snap);
 
     for (files) |f| {
         const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/{s}/{s}", .{ repo, commit, f });
@@ -126,25 +126,25 @@ fn download(allocator: Allocator, env: *const std.process.Environ.Map, repo: []c
         const dest = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ snap, f });
         defer allocator.free(dest);
 
-        sys.eprintf("downloading {s}/{s} ...\n", .{ repo, f });
+        sys.eprintf(io, "downloading {s}/{s} ...\n", .{ repo, f });
         {
-            const out = try cwd.createFile(sys.io, tmp, .{});
-            defer out.close(sys.io);
-            errdefer cwd.deleteFile(sys.io, tmp) catch {};
+            const out = try cwd.createFile(io, tmp, .{});
+            defer out.close(io);
+            errdefer cwd.deleteFile(io, tmp) catch {};
             var buf: [64 * 1024]u8 = undefined;
-            var fw = out.writer(sys.io, &buf);
-            try fetch(allocator, url, &fw.interface, token);
+            var fw = out.writer(io, &buf);
+            try fetch(io, allocator, url, &fw.interface, token);
             try fw.interface.flush();
         }
-        try cwd.rename(tmp, cwd, dest, sys.io);
+        try cwd.rename(tmp, cwd, dest, io);
     }
 
     // refs/<revision> -> commit, as huggingface_hub writes it.
     const refs_dir = try std.fmt.allocPrint(allocator, "{s}/refs", .{repo_dir});
     defer allocator.free(refs_dir);
-    try cwd.createDirPath(sys.io, refs_dir);
+    try cwd.createDirPath(io, refs_dir);
     const ref_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ refs_dir, revision });
     defer allocator.free(ref_path);
-    try cwd.writeFile(sys.io, .{ .sub_path = ref_path, .data = commit });
+    try cwd.writeFile(io, .{ .sub_path = ref_path, .data = commit });
     return snap;
 }

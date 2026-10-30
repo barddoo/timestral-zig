@@ -56,11 +56,11 @@ const ResBlock = struct {
     hid: usize,
     out: usize,
 
-    fn load(w: *st.Weights, buf: []u8, prefix: []const u8, in: usize, hid: usize, out: usize, bias: bool) !ResBlock {
+    fn load(io: std.Io, w: *st.Weights, buf: []u8, prefix: []const u8, in: usize, hid: usize, out: usize, bias: bool) !ResBlock {
         return .{
-            .hidden = try loadLinear(w, buf, prefix, "hidden_layer", hid, in, bias),
-            .output = try loadLinear(w, buf, prefix, "output_layer", out, hid, bias),
-            .residual = try loadLinear(w, buf, prefix, "residual_layer", out, in, bias),
+            .hidden = try loadLinear(io, w, buf, prefix, "hidden_layer", hid, in, bias),
+            .output = try loadLinear(io, w, buf, prefix, "output_layer", out, hid, bias),
+            .residual = try loadLinear(io, w, buf, prefix, "residual_layer", out, in, bias),
             .in = in,
             .hid = hid,
             .out = out,
@@ -85,13 +85,13 @@ fn tensorName(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch unreachable;
 }
 
-fn loadLinear(w: *st.Weights, buf: []u8, prefix: []const u8, name: []const u8, out: usize, in: usize, bias: bool) !Linear {
+fn loadLinear(io: std.Io, w: *st.Weights, buf: []u8, prefix: []const u8, name: []const u8, out: usize, in: usize, bias: bool) !Linear {
     const wn = tensorName(buf, "{s}.{s}.weight", .{ prefix, name });
-    const weight = try w.get(wn, out * in);
+    const weight = try w.get(io, wn, out * in);
     var bv: ?[]const f32 = null;
     if (bias) {
         const bn = tensorName(buf, "{s}.{s}.bias", .{ prefix, name });
-        bv = try w.get(bn, out);
+        bv = try w.get(io, bn, out);
     }
     return .{ .w = weight, .b = bv };
 }
@@ -143,16 +143,16 @@ pub const Model = struct {
     head: ResBlock,
     inv_freq: []f32, // head_dim / 2 entries; zero past rope_dim / 2 (identity rotation)
 
-    pub fn load(allocator: Allocator, config: cfg.Config, w: *st.Weights) !Model {
+    pub fn load(io: std.Io, allocator: Allocator, config: cfg.Config, w: *st.Weights) !Model {
         const d: usize = config.d_model;
         const ps: usize = config.patch_size;
         const hid: usize = config.mlp_hidden_dim;
         var buf: [256]u8 = undefined;
 
-        const patch_proj = try ResBlock.load(w, &buf, "representation.patch_proj", 2 * ps, 4 * d, d, true);
-        const forecast_query = try w.get("representation.forecast_query", d);
-        const head = try ResBlock.load(w, &buf, "head.projection", d, 4 * d, ps * config.numQuantiles(), false);
-        const out_norm = try w.get("transformer.out_norm.scale", d);
+        const patch_proj = try ResBlock.load(io, w, &buf, "representation.patch_proj", 2 * ps, 4 * d, d, true);
+        const forecast_query = try w.get(io, "representation.forecast_query", d);
+        const head = try ResBlock.load(io, w, &buf, "head.projection", d, 4 * d, ps * config.numQuantiles(), false);
+        const out_norm = try w.get(io, "transformer.out_norm.scale", d);
 
         const layers = try allocator.alloc(Layer, config.block_schedule.len);
         errdefer allocator.free(layers);
@@ -165,18 +165,18 @@ pub const Model = struct {
                 const gate_kind = if (is_time) config.time_attn_gate else config.variate_attn_gate;
                 var a: Attn = undefined;
                 a.is_time = is_time;
-                a.norm = try w.get(tensorName(&buf, "transformer.layers.{d}.attn_norms.{d}.scale", .{ li, ai }), d);
-                a.qkv = try w.get(tensorName(&buf, "transformer.layers.{d}.attns.{d}.wQKV.weight", .{ li, ai }), 3 * d * d);
-                a.out = try w.get(tensorName(&buf, "transformer.layers.{d}.attns.{d}.wO.weight", .{ li, ai }), d * d);
+                a.norm = try w.get(io, tensorName(&buf, "transformer.layers.{d}.attn_norms.{d}.scale", .{ li, ai }), d);
+                a.qkv = try w.get(io, tensorName(&buf, "transformer.layers.{d}.attns.{d}.wQKV.weight", .{ li, ai }), 3 * d * d);
+                a.out = try w.get(io, tensorName(&buf, "transformer.layers.{d}.attns.{d}.wO.weight", .{ li, ai }), d * d);
                 a.gate = if (std.mem.eql(u8, gate_kind, "sdpa_sigmoid"))
-                    try w.get(tensorName(&buf, "transformer.layers.{d}.attns.{d}._gate.weight", .{ li, ai }), d * d)
+                    try w.get(io, tensorName(&buf, "transformer.layers.{d}.attns.{d}._gate.weight", .{ li, ai }), d * d)
                 else
                     null;
                 layer.attns[ai] = a;
             }
-            layer.mlp_norm = try w.get(tensorName(&buf, "transformer.layers.{d}.mlp_norm.scale", .{li}), d);
-            layer.w12 = try w.get(tensorName(&buf, "transformer.layers.{d}.mlp.w12.weight", .{li}), 2 * hid * d);
-            layer.w3 = try w.get(tensorName(&buf, "transformer.layers.{d}.mlp.w3.weight", .{li}), d * hid);
+            layer.mlp_norm = try w.get(io, tensorName(&buf, "transformer.layers.{d}.mlp_norm.scale", .{li}), d);
+            layer.w12 = try w.get(io, tensorName(&buf, "transformer.layers.{d}.mlp.w12.weight", .{li}), 2 * hid * d);
+            layer.w3 = try w.get(io, tensorName(&buf, "transformer.layers.{d}.mlp.w3.weight", .{li}), d * hid);
             layers[li] = layer;
         }
 

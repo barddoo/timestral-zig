@@ -11,9 +11,9 @@ pub const Weights = struct {
     header: std.json.Parsed(std.json.Value),
     data_start: usize,
 
-    pub fn open(allocator: std.mem.Allocator, path: []const u8) !Weights {
-        var map = try sys.Mapped.open(path);
-        errdefer map.close();
+    pub fn open(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !Weights {
+        var map = try sys.Mapped.open(io, path);
+        errdefer map.close(io);
         if (map.bytes.len < 8) return error.InvalidSafetensors;
         const hlen: usize = @intCast(std.mem.readInt(u64, map.bytes[0..8], .little));
         if (8 + hlen > map.bytes.len) return error.InvalidSafetensors;
@@ -21,17 +21,17 @@ pub const Weights = struct {
         return .{ .allocator = allocator, .map = map, .header = header, .data_start = 8 + hlen };
     }
 
-    pub fn close(self: *Weights) void {
+    pub fn close(self: *Weights, io: std.Io) void {
         for (self.converted.items) |buf| self.allocator.free(buf);
         self.converted.deinit(self.allocator);
         self.header.deinit();
-        self.map.close();
+        self.map.close(io);
     }
 
     /// The named float32 tensor, checked against the expected element count.
-    pub fn get(self: *Weights, name: []const u8, numel: usize) ![]const f32 {
+    pub fn get(self: *Weights, io: std.Io, name: []const u8, numel: usize) ![]const f32 {
         const entry = self.header.value.object.get(name) orelse {
-            sys.eprintf("missing tensor: {s}\n", .{name});
+            sys.eprintf(io, "missing tensor: {s}\n", .{name});
             return error.MissingTensor;
         };
         const obj = entry.object;
@@ -40,11 +40,11 @@ pub const Weights = struct {
         const begin: usize = @intCast(offs[0].integer);
         const end: usize = @intCast(offs[1].integer);
         const elem: usize = if (std.mem.eql(u8, dtype, "F32")) 4 else if (std.mem.eql(u8, dtype, "F16") or std.mem.eql(u8, dtype, "BF16")) 2 else {
-            sys.eprintf("tensor {s} has unsupported dtype {s}\n", .{ name, dtype });
+            sys.eprintf(io, "tensor {s} has unsupported dtype {s}\n", .{ name, dtype });
             return error.UnsupportedDtype;
         };
         if (end - begin != numel * elem) {
-            sys.eprintf("tensor {s}: expected {d} elements, file has {d}\n", .{ name, numel, (end - begin) / elem });
+            sys.eprintf(io, "tensor {s}: expected {d} elements, file has {d}\n", .{ name, numel, (end - begin) / elem });
             return error.ShapeMismatch;
         }
         const bytes = self.map.bytes[self.data_start + begin ..][0 .. end - begin];
