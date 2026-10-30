@@ -68,15 +68,15 @@ const ResBlock = struct {
     }
 
     /// `output(silu(hidden(x))) + residual(x)` for `rows` input vectors.
-    fn forward(self: ResBlock, allocator: Allocator, y: []f32, x: []const f32, rows: usize) !void {
+    fn forward(self: ResBlock, io: std.Io, allocator: Allocator, y: []f32, x: []const f32, rows: usize) !void {
         const h = try allocator.alloc(f32, rows * self.hid);
         defer allocator.free(h);
-        nn.linear(h, x, rows, self.hidden.w, self.hid, self.in, self.hidden.b);
+        nn.linear(io, h, x, rows, self.hidden.w, self.hid, self.in, self.hidden.b);
         for (h) |*v| v.* = nn.silu(v.*);
-        nn.linear(y, h, rows, self.output.w, self.out, self.hid, self.output.b);
+        nn.linear(io, y, h, rows, self.output.w, self.out, self.hid, self.output.b);
         const r = try allocator.alloc(f32, rows * self.out);
         defer allocator.free(r);
-        nn.linear(r, x, rows, self.residual.w, self.out, self.in, self.residual.b);
+        nn.linear(io, r, x, rows, self.residual.w, self.out, self.in, self.residual.b);
         for (y[0 .. rows * self.out], r) |*a, b| a.* += b;
     }
 };
@@ -209,14 +209,14 @@ pub const Model = struct {
     /// Per-patch causal `(loc, scale)` of packed `(R, T)` rows, each `(R, T / patch_size)`.
     /// Each patch uses the running mean/std (float64 Welford) of everything observed up to
     /// its last step, then both are rounded to float32.
-    pub fn patchStats(self: *const Model, loc: []f32, scale: []f32, data: []const f32, observed: []const bool, rows: usize, t: usize) void {
+    pub fn patchStats(self: *const Model, io: std.Io, loc: []f32, scale: []f32, data: []const f32, observed: []const bool, rows: usize, t: usize) void {
         const job: StatsJob = .{ .model = self, .loc = loc, .scale = scale, .data = data, .observed = observed, .t = t };
-        par.forRangeMin(rows, 4, &job, StatsJob.run);
+        par.forRangeMin(io, rows, 4, &job, StatsJob.run);
     }
 
     /// Quantiles `(T, h * patch_size, Q)` in data units for the target rows after the packed
     /// context, `T` being the number of target rows (series by series, in `roles` order).
-    pub fn predictBlock(self: *const Model, allocator: Allocator, out: []f32, in: BlockInput) !void {
+    pub fn predictBlock(self: *const Model, io: std.Io, allocator: Allocator, out: []f32, in: BlockInput) !void {
         const c = self.config;
         const ps: usize = c.patch_size;
         const d: usize = c.d_model;
@@ -267,7 +267,7 @@ pub const Model = struct {
         // Causal per-patch normalization.
         const loc = try arena.alloc(f32, rows * n);
         const scale = try arena.alloc(f32, rows * n);
-        self.patchStats(loc, scale, full, full_obs, rows, w);
+        self.patchStats(io, loc, scale, full, full_obs, rows, w);
         const eps32 = std.math.floatEps(f32);
         const emb_in = try arena.alloc(f32, rows * n * 2 * ps);
         for (0..rows) |r| {
@@ -325,7 +325,7 @@ pub const Model = struct {
         const sl = ne + h;
         const x = try arena.alloc(f32, rows * sl * d);
         const enc = try arena.alloc(f32, rows * ne * d);
-        try self.patch_proj.forward(arena, enc, emb_in, rows * ne);
+        try self.patch_proj.forward(io, arena, enc, emb_in, rows * ne);
         for (0..rows) |r| {
             @memcpy(x[r * sl * d ..][0 .. ne * d], enc[r * ne * d ..][0 .. ne * d]);
             for (0..h) |j| @memcpy(x[(r * sl + ne + j) * d ..][0..d], self.forecast_query);
@@ -362,7 +362,7 @@ pub const Model = struct {
             .key_valid = key_valid,
             .first_obs = first_obs,
         };
-        try self.runTransformer(arena, x, geo);
+        try self.runTransformer(io, arena, x, geo);
 
         // Head on the target rows' decoder tokens.
         const n_rows_out = in.groups * n_tgt;
@@ -370,11 +370,11 @@ pub const Model = struct {
         var oi: usize = 0;
         for (0..rows) |r| {
             if (in.roles[r % vall] != .target) continue;
-            nn.rmsNorm(dec[oi * h * d ..][0 .. h * d], x[(r * sl + ne) * d ..][0 .. h * d], h, d, self.out_norm, @floatCast(c.norm_eps));
+            nn.rmsNorm(io, dec[oi * h * d ..][0 .. h * d], x[(r * sl + ne) * d ..][0 .. h * d], h, d, self.out_norm, @floatCast(c.norm_eps));
             oi += 1;
         }
         const raw = try arena.alloc(f32, n_rows_out * hl * q);
-        try self.head.forward(arena, raw, dec, n_rows_out * h);
+        try self.head.forward(io, arena, raw, dec, n_rows_out * h);
 
         const m = c.medianIndex();
         const widths = try arena.alloc(f32, q);
@@ -419,7 +419,7 @@ pub const Model = struct {
         }
     }
 
-    fn runTransformer(self: *const Model, arena: Allocator, x: []f32, geo: Geo) !void {
+    fn runTransformer(self: *const Model, io: std.Io, arena: Allocator, x: []f32, geo: Geo) !void {
         const c = self.config;
         const d: usize = c.d_model;
         const sl = geo.s();
@@ -452,19 +452,19 @@ pub const Model = struct {
 
         for (self.layers) |layer| {
             for (layer.attns[0..layer.n_attn]) |a| {
-                nn.rmsNorm(xn, x, rows * sl, d, a.norm, eps);
+                nn.rmsNorm(io, xn, x, rows * sl, d, a.norm, eps);
                 if (a.is_time) {
-                    try self.timeAttention(arena, delta, xn, a, geo, cos_t, sin_t);
+                    try self.timeAttention(io, arena, delta, xn, a, geo, cos_t, sin_t);
                 } else {
-                    try self.variateAttention(arena, delta, xn, a, geo);
+                    try self.variateAttention(io, arena, delta, xn, a, geo);
                 }
                 for (x, delta[0..x.len]) |*xv, dv| xv.* += dv;
             }
-            nn.rmsNorm(xn, x, rows * sl, d, layer.mlp_norm, eps);
-            nn.linear(mlp_h, xn, rows * sl, layer.w12, 2 * hid, d, null);
+            nn.rmsNorm(io, xn, x, rows * sl, d, layer.mlp_norm, eps);
+            nn.linear(io, mlp_h, xn, rows * sl, layer.w12, 2 * hid, d, null);
             const act: MlpAct = .{ .h = mlp_h, .a = mlp_a, .hid = hid };
-            par.forRangeMin(rows * sl, 32, &act, MlpAct.run);
-            nn.linear(delta, mlp_a, rows * sl, layer.w3, d, hid, null);
+            par.forRangeMin(io, rows * sl, 32, &act, MlpAct.run);
+            nn.linear(io, delta, mlp_a, rows * sl, layer.w3, d, hid, null);
             for (x, delta[0..x.len]) |*xv, dv| xv.* += dv;
         }
     }
@@ -472,14 +472,14 @@ pub const Model = struct {
     /// Time attention per row over `[Enc ; Dec]`. Encoder queries read valid encoder keys
     /// causally (diagonal always open); known-future rows read all valid keys. Decoder queries
     /// read the valid context keys and their own causal decoder chain.
-    fn timeAttention(self: *const Model, arena: Allocator, out: []f32, xn: []const f32, a: Attn, geo: Geo, cos_t: []const f32, sin_t: []const f32) !void {
+    fn timeAttention(self: *const Model, io: std.Io, arena: Allocator, out: []f32, xn: []const f32, a: Attn, geo: Geo, cos_t: []const f32, sin_t: []const f32) !void {
         const c = self.config;
         const d: usize = c.d_model;
         const rows = geo.rows;
         const sl = geo.s();
 
         const qkv = try arena.alloc(f32, rows * sl * 3 * d);
-        nn.linear(qkv, xn, rows * sl, a.qkv, 3 * d, d, null);
+        nn.linear(io, qkv, xn, rows * sl, a.qkv, 3 * d, d, null);
         const qa = try arena.alloc(f32, rows * sl * d);
         const ka = try arena.alloc(f32, rows * sl * d);
         const va = try arena.alloc(f32, rows * sl * d);
@@ -487,7 +487,7 @@ pub const Model = struct {
 
         const gate = if (a.gate) |gw| blk: {
             const g = try arena.alloc(f32, rows * sl * d);
-            nn.linear(g, xn, rows * sl, gw, d, d, null);
+            nn.linear(io, g, xn, rows * sl, gw, d, d, null);
             break :blk g;
         } else null;
 
@@ -503,16 +503,16 @@ pub const Model = struct {
             .sin_t = sin_t,
         };
         // Phase 1: split the fused projection into heads and apply RoPE, per token.
-        par.forRangeMin(rows * sl, 16, &job, TimeJob.prepare);
+        par.forRangeMin(io, rows * sl, 16, &job, TimeJob.prepare);
         // Phase 2: attention per (row, head).
-        par.forRange(rows * c.num_heads, &job, TimeJob.attend);
+        par.forRange(io, rows * c.num_heads, &job, TimeJob.attend);
         // Phase 3: gate, then the output projection.
         if (gate) |gt| {
             const gj: GateJob = .{ .dst = out, .x = oa, .g = gt, .per = sl * d };
-            par.forRange(rows, &gj, GateJob.run);
+            par.forRange(io, rows, &gj, GateJob.run);
         } else @memcpy(out[0 .. rows * sl * d], oa);
         const proj = try arena.alloc(f32, rows * sl * d);
-        nn.linear(proj, out[0 .. rows * sl * d], rows * sl, a.out, d, d, null);
+        nn.linear(io, proj, out[0 .. rows * sl * d], rows * sl, a.out, d, d, null);
         @memcpy(out[0 .. rows * sl * d], proj);
     }
 
@@ -520,25 +520,25 @@ pub const Model = struct {
     /// reads another row on an encoder slot only if that row's patch is a valid key. With
     /// covariates two firewalls apply: a covariate row never reads a target row, and a
     /// known-future row never reads a causal row. The diagonal is always open.
-    fn variateAttention(self: *const Model, arena: Allocator, out: []f32, xn: []const f32, a: Attn, geo: Geo) !void {
+    fn variateAttention(self: *const Model, io: std.Io, arena: Allocator, out: []f32, xn: []const f32, a: Attn, geo: Geo) !void {
         const c = self.config;
         const d: usize = c.d_model;
         const rows = geo.rows;
         const sl = geo.s();
 
         const qkv = try arena.alloc(f32, rows * sl * 3 * d);
-        nn.linear(qkv, xn, rows * sl, a.qkv, 3 * d, d, null);
+        nn.linear(io, qkv, xn, rows * sl, a.qkv, 3 * d, d, null);
         const gate = if (a.gate) |gw| blk: {
             const g = try arena.alloc(f32, rows * sl * d);
-            nn.linear(g, xn, rows * sl, gw, d, d, null);
+            nn.linear(io, g, xn, rows * sl, gw, d, d, null);
             break :blk g;
         } else null;
 
         const o = try arena.alloc(f32, rows * sl * d);
         const job: VariateJob = .{ .model = self, .geo = geo, .qkv = qkv, .o = o };
-        par.forRangeMin(geo.groups * sl, 8, &job, VariateJob.run);
+        par.forRangeMin(io, geo.groups * sl, 8, &job, VariateJob.run);
         if (gate) |gt| nn.mulSigmoid(o, o, gt);
-        nn.linear(out[0 .. rows * sl * d], o, rows * sl, a.out, d, d, null);
+        nn.linear(io, out[0 .. rows * sl * d], o, rows * sl, a.out, d, d, null);
     }
 };
 

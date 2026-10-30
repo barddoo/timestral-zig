@@ -211,7 +211,7 @@ fn run(init: std.process.Init) !void {
     var threaded: std.Io.Threaded = .init(allocator, .{ .async_limit = .limited(par.threads - 1) });
     defer threaded.deinit();
     const io = threaded.io();
-    if (par.threads > 1) par.io = io;
+    const par_io: std.Io = if (par.threads > 1) io else std.Io.Threaded.global_single_threaded.io();
     const t_start = sys.now(io);
 
     const model_dir = hub.resolve(io, allocator, init.environ_map, args.model, args.revision, args.offline) catch |err| {
@@ -277,7 +277,7 @@ fn run(init: std.process.Init) !void {
         cov.n_cat_known = k.rows;
     }
 
-    const result = try forecaster.forecast(allocator, &model, values, observed, b, v, t, args.horizon, cov, args.opts);
+    const result = try forecaster.forecast(allocator, par_io, &model, values, observed, b, v, t, args.horizon, cov, args.opts);
     defer allocator.free(result);
     if (args.time) sys.eprintf(io, "load={d:.3}s forecast={d:.3}s\n", .{ t_loaded - t_start, sys.now(io) - t_loaded });
 

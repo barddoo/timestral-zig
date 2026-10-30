@@ -53,6 +53,7 @@ const Rows = struct {
 /// the same shape. Returns `(B, V, horizon, Q)` quantiles; the caller frees the slice.
 pub fn forecast(
     allocator: Allocator,
+    io: std.Io,
     model: *const Model,
     inputs: []const f32,
     observed: []const bool,
@@ -93,7 +94,7 @@ pub fn forecast(
     };
     if (rows.n_past == 0 and rows.n_known == 0 and any_cov) return error.InvalidInput;
 
-    var fwd: Pass = .{ .allocator = allocator, .model = model, .inputs = inputs, .observed = observed, .b = b, .v = v, .t = t, .horizon = horizon, .rows = rows, .opts = o };
+    var fwd: Pass = .{ .allocator = allocator, .io = io, .model = model, .inputs = inputs, .observed = observed, .b = b, .v = v, .t = t, .horizon = horizon, .rows = rows, .opts = o };
     if (o.symmetric_averaging) {
         const levels = cfgm.quantile_knots;
         for (levels, 0..) |lo, i| {
@@ -111,7 +112,7 @@ pub fn forecast(
         var mir = fwd;
         mir.inputs = neg;
         mir.rows = mrows;
-        par.both(&fwd, Pass.run, &mir, Pass.run);
+        par.both(io, &fwd, Pass.run, &mir, Pass.run);
         const mirrored = mir.result catch |err| {
             if (fwd.result) |r| allocator.free(r) else |_| {}
             return err;
@@ -132,6 +133,7 @@ pub fn forecast(
 
 const Pass = struct {
     allocator: Allocator,
+    io: std.Io,
     model: *const Model,
     inputs: []const f32,
     observed: []const bool,
@@ -144,7 +146,7 @@ const Pass = struct {
     result: anyerror![]f32 = error.NotRun,
 
     fn run(self: *Pass) void {
-        self.result = forecastRaw(self.allocator, self.model, self.inputs, self.observed, self.b, self.v, self.t, self.horizon, self.rows, self.opts);
+        self.result = forecastRaw(self.allocator, self.io, self.model, self.inputs, self.observed, self.b, self.v, self.t, self.horizon, self.rows, self.opts);
     }
 };
 
@@ -291,6 +293,7 @@ fn slotOf(categories: []const f64, code: f64) ?usize {
 
 fn forecastRaw(
     allocator: Allocator,
+    io: std.Io,
     model: *const Model,
     inputs: []const f32,
     observed: []const bool,
@@ -379,7 +382,7 @@ fn forecastRaw(
     const out = try allocator.alloc(f32, nt * horizon * q);
     errdefer allocator.free(out);
     const known_any = cov.n_known > 0;
-    try blockDecode(allocator, model, out, rows, mask, if (known_any) kf else null, if (known_any) kfm else null, hpad, b, roles, t, horizon, o);
+    try blockDecode(io, allocator, model, out, rows, mask, if (known_any) kf else null, if (known_any) kfm else null, hpad, b, roles, t, horizon, o);
 
     if (o.quantile_real_cap_k > 0) {
         const n = t / ps;
@@ -390,7 +393,7 @@ fn forecastRaw(
         for (0..b) |s| {
             for (0..v) |i| {
                 const r = s * vall + i;
-                model.patchStats(loc, scale, rows[r * t ..][0..t], mask[r * t ..][0..t], 1, t);
+                model.patchStats(io, loc, scale, rows[r * t ..][0..t], mask[r * t ..][0..t], 1, t);
                 var mx: f32 = -std.math.inf(f32);
                 var mn: f32 = std.math.inf(f32);
                 for (0..t) |j| if (mask[r * t + j]) {
@@ -409,6 +412,7 @@ fn forecastRaw(
 }
 
 fn blockDecode(
+    io: std.Io,
     allocator: Allocator,
     model: *const Model,
     out: []f32,
@@ -462,7 +466,7 @@ fn blockDecode(
         defer if (kfb) |x| allocator.free(x);
         defer if (kfmb) |x| allocator.free(x);
 
-        try model.predictBlock(allocator, qs, .{
+        try model.predictBlock(io, allocator, qs, .{
             .ctx = ctx,
             .obs = cmask,
             .t = t,
@@ -472,7 +476,7 @@ fn blockDecode(
             .known_future = kfb,
             .known_future_obs = kfmb,
         });
-        if (block > 1) try refineBlock(allocator, model, qs, ctx, cmask, groups, vall, v, t, block);
+        if (block > 1) try refineBlock(io, allocator, model, qs, ctx, cmask, groups, vall, v, t, block);
 
         for (0..nt) |r| {
             for (0..blen) |s| {
@@ -548,7 +552,7 @@ fn welfordCombine(a: Welford, b: Welford) Welford {
 /// Moves a decoded block `(T, h * patch_size, Q)` of the target rows from the anchor frame of
 /// the last context patch to the advancing refine frame it was trained in: horizon patch `j` is
 /// normalized with the statistics of the context plus the block's medians of patches `0..j-1`.
-fn refineBlock(allocator: Allocator, model: *const Model, qs: []f32, ctx: []const f32, mask: []const bool, groups: usize, vall: usize, v: usize, t: usize, h: usize) !void {
+fn refineBlock(io: std.Io, allocator: Allocator, model: *const Model, qs: []f32, ctx: []const f32, mask: []const bool, groups: usize, vall: usize, v: usize, t: usize, h: usize) !void {
     const c = model.config;
     const ps: usize = c.patch_size;
     const q = c.numQuantiles();
@@ -573,7 +577,7 @@ fn refineBlock(allocator: Allocator, model: *const Model, qs: []f32, ctx: []cons
             const r = g * vall + i; // row in the packed context
             const row_ctx = ctx[r * t ..][0..t];
             const row_mask = mask[r * t ..][0..t];
-            model.patchStats(loc, scale, row_ctx, row_mask, 1, t);
+            model.patchStats(io, loc, scale, row_ctx, row_mask, 1, t);
             const loc0 = loc[l - 1];
             const scale0 = scale[l - 1];
             const block = qs[(g * v + i) * h * ps * q ..][0 .. h * ps * q];
